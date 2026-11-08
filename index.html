@@ -776,14 +776,18 @@
                     return;
                 }
 
-                for (let index = 1; index < stroke.points.length; index++) {
-                    page.drawLine({
-                        start: stroke.points[index - 1],
-                        end: stroke.points[index],
-                        thickness: stroke.thickness,
-                        color
-                    });
-                }
+                const pathOperators = [
+                    PDFLib.pushGraphicsState(),
+                    PDFLib.setLineCap(PDFLib.LineCapStyle.Round),
+                    PDFLib.setLineJoin(PDFLib.LineJoinStyle.Round),
+                    PDFLib.setLineWidth(stroke.thickness),
+                    PDFLib.setStrokingColor(color),
+                    PDFLib.moveTo(stroke.points[0].x, stroke.points[0].y),
+                    ...stroke.points.slice(1).map(point => PDFLib.lineTo(point.x, point.y)),
+                    PDFLib.stroke(),
+                    PDFLib.popGraphicsState()
+                ];
+                page.pushOperators(...pathOperators);
             });
         }
 
