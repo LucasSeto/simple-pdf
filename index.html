@@ -238,6 +238,7 @@
         let currentPageIndex = 0;
         let renderGeneration = 0;
         let isUpdating = false;
+        let pendingZoomUpdate = false;
         let isDrawing = false;
         let isErasing = false;
         let isSelecting = false;
@@ -475,6 +476,7 @@
 
         async function renderPages(targetPageIndex = currentPageIndex) {
             const generation = ++renderGeneration;
+            const renderZoom = zoom;
             const existingPages = pdfViewer.querySelectorAll(".pdf-page:not(.pdf-render-page)");
             const anchorIndex = Math.min(targetPageIndex, existingPages.length - 1);
             const anchorTop = anchorIndex >= 0
@@ -496,7 +498,7 @@
                     const page = await renderedDocument.getPage(index + 1);
                     if (generation !== renderGeneration) return;
 
-                    const viewport = page.getViewport({ scale: zoom });
+                    const viewport = page.getViewport({ scale: renderZoom });
                     const wrapper = document.createElement("div");
                     const canvas = document.createElement("canvas");
                     const inkCanvas = document.createElement("canvas");
@@ -586,6 +588,10 @@
             } finally {
                 isUpdating = false;
                 updatePageControls();
+                if (pendingZoomUpdate) {
+                    pendingZoomUpdate = false;
+                    await updateDocument(currentPageIndex);
+                }
             }
         }
 
@@ -1174,6 +1180,28 @@
         });
 
         pdfViewer.addEventListener("scroll", updateCurrentPage, { passive: true });
+
+        pdfViewer.addEventListener("wheel", function(event) {
+            if (!event.ctrlKey || !pdfDocument) return;
+
+            event.preventDefault();
+            if (activeStrokeCount > 0 || event.deltaY === 0) return;
+
+            currentPageIndex = findCurrentPageIndex();
+            const deltaMultiplier = event.deltaMode === WheelEvent.DOM_DELTA_LINE
+                ? 16
+                : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? pdfViewer.clientHeight : 1;
+            const zoomDelta = event.deltaY * deltaMultiplier;
+            const previousZoom = zoom;
+            zoom = Math.max(minZoom, Math.min(maxZoom, zoom * Math.exp(-zoomDelta * 0.0015)));
+            if (zoom === previousZoom) return;
+            if (isUpdating) {
+                pendingZoomUpdate = true;
+                updatePageControls();
+                return;
+            }
+            void updateDocument(currentPageIndex);
+        }, { passive: false });
 
         zoomOutButton.addEventListener("click", async function() {
             if (zoom <= minZoom || isUpdating) return;
