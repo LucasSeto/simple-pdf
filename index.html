@@ -65,6 +65,11 @@
             touch-action: none;
         }
 
+        #pdfViewer.selecting .ink-layer {
+            cursor: crosshair;
+            touch-action: none;
+        }
+
         #inkColor {
             border: 0;
             border-radius: 50%;
@@ -139,6 +144,7 @@
         <span id="currentPage" aria-live="polite"></span>
         <button id="drawToggle" type="button" aria-pressed="false">Draw</button>
         <button id="eraseToggle" type="button" aria-pressed="false">Erase</button>
+        <button id="selectToggle" type="button" aria-pressed="false">Lasso select</button>
         <label for="inkColor">Color</label>
         <input id="inkColor" type="color" value="#e53935" aria-label="Drawing color">
         <label for="inkThickness">Thickness</label>
@@ -167,6 +173,7 @@
         const currentPageLabel = document.getElementById("currentPage");
         const drawToggle = document.getElementById("drawToggle");
         const eraseToggle = document.getElementById("eraseToggle");
+        const selectToggle = document.getElementById("selectToggle");
         const inkColor = document.getElementById("inkColor");
         const inkThickness = document.getElementById("inkThickness");
         const inkThicknessValue = document.getElementById("inkThicknessValue");
@@ -184,8 +191,10 @@
         let isUpdating = false;
         let isDrawing = false;
         let isErasing = false;
+        let isSelecting = false;
         let activeStrokeCount = 0;
         let drawingsByPage = [];
+        let selectedStrokesByPage = [];
         let pdfFileName = "annotated.pdf";
 
         pdfjsLib.GlobalWorkerOptions.workerSrc =
@@ -203,6 +212,7 @@
             zoomInButton.disabled = isUpdating || activeStrokeCount > 0 || zoom >= maxZoom;
             drawToggle.disabled = isUpdating || activeStrokeCount > 0;
             eraseToggle.disabled = isUpdating || activeStrokeCount > 0;
+            selectToggle.disabled = isUpdating || activeStrokeCount > 0;
             downloadPdfButton.disabled = isUpdating || activeStrokeCount > 0;
             zoomLevel.textContent = `${Math.round(zoom * 100)}%`;
             pdfViewer.querySelectorAll(".page-editor-control").forEach(button => {
@@ -297,7 +307,7 @@
                     pdfViewer.appendChild(wrapper);
                     stagedPages.push(wrapper);
                     await page.render({ canvasContext: context, viewport }).promise;
-                    redrawInk(inkContext, index, viewport, pixelRatio);
+                    redrawInk(inkContext, index, viewport, pixelRatio, selectedStrokesByPage[index]);
                     addDrawingHandlers(inkCanvas, index, viewport, pixelRatio);
                 }
 
@@ -351,7 +361,7 @@
             );
         }
 
-        function redrawInk(context, pageIndex, viewport, pixelRatio) {
+        function redrawInk(context, pageIndex, viewport, pixelRatio, selectedStrokes = new Set()) {
             context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
             context.clearRect(0, 0, context.canvas.width, context.canvas.height);
 
@@ -368,6 +378,10 @@
                         0,
                         Math.PI * 2
                     );
+                    if (selectedStrokes.has(stroke)) {
+                        context.fillStyle = "rgba(30, 120, 255, 0.45)";
+                        context.fill();
+                    }
                     context.fillStyle = stroke.color;
                     context.fill();
                     return;
@@ -375,6 +389,16 @@
 
                 context.moveTo(points[0][0], points[0][1]);
                 points.slice(1).forEach(point => context.lineTo(point[0], point[1]));
+                if (selectedStrokes.has(stroke)) {
+                    context.strokeStyle = "rgba(30, 120, 255, 0.55)";
+                    context.lineWidth = stroke.thickness * viewport.scale + 6;
+                    context.lineCap = "round";
+                    context.lineJoin = "round";
+                    context.stroke();
+                    context.beginPath();
+                    context.moveTo(points[0][0], points[0][1]);
+                    points.slice(1).forEach(point => context.lineTo(point[0], point[1]));
+                }
                 context.strokeStyle = stroke.color;
                 context.lineWidth = stroke.thickness * viewport.scale;
                 context.lineCap = "round";
@@ -383,12 +407,101 @@
             });
         }
 
+        function drawLasso(context, points) {
+            if (points.length < 2) return;
+            context.save();
+            context.beginPath();
+            context.moveTo(points[0].x, points[0].y);
+            points.slice(1).forEach(point => context.lineTo(point.x, point.y));
+            context.strokeStyle = "#1677ff";
+            context.lineWidth = 2;
+            context.setLineDash([6, 4]);
+            context.stroke();
+            context.restore();
+        }
+
+        function strokeContainsPoint(stroke, point, viewport) {
+            const points = stroke.points.map(pdfPoint => {
+                const [x, y] = viewport.convertToViewportPoint(pdfPoint.x, pdfPoint.y);
+                return { x, y };
+            });
+            const tolerance = 12 + stroke.thickness * viewport.scale / 2;
+            if (points.length === 1) {
+                return Math.hypot(point.x - points[0].x, point.y - points[0].y) <= tolerance;
+            }
+            return points.slice(1).some((end, index) =>
+                distanceToSegment(point, points[index], end) <= tolerance
+            );
+        }
+
+        function pointInPolygon(point, polygon) {
+            let inside = false;
+            for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index++) {
+                const currentPoint = polygon[index];
+                const previousPoint = polygon[previous];
+                const crosses = (currentPoint.y > point.y) !== (previousPoint.y > point.y) &&
+                    point.x < (previousPoint.x - currentPoint.x) *
+                    (point.y - currentPoint.y) /
+                    (previousPoint.y - currentPoint.y) + currentPoint.x;
+                if (crosses) inside = !inside;
+            }
+            return inside;
+        }
+
+        function segmentsIntersect(firstStart, firstEnd, secondStart, secondEnd) {
+            const orientation = (a, b, c) =>
+                (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            const first = orientation(firstStart, firstEnd, secondStart);
+            const second = orientation(firstStart, firstEnd, secondEnd);
+            const third = orientation(secondStart, secondEnd, firstStart);
+            const fourth = orientation(secondStart, secondEnd, firstEnd);
+            const epsilon = 1e-8;
+            const onSegment = (start, point, end) =>
+                point.x >= Math.min(start.x, end.x) - epsilon &&
+                point.x <= Math.max(start.x, end.x) + epsilon &&
+                point.y >= Math.min(start.y, end.y) - epsilon &&
+                point.y <= Math.max(start.y, end.y) + epsilon;
+
+            if (((first > epsilon && second < -epsilon) ||
+                (first < -epsilon && second > epsilon)) &&
+                ((third > epsilon && fourth < -epsilon) ||
+                (third < -epsilon && fourth > epsilon))) return true;
+            return (Math.abs(first) <= epsilon && onSegment(firstStart, secondStart, firstEnd)) ||
+                (Math.abs(second) <= epsilon && onSegment(firstStart, secondEnd, firstEnd)) ||
+                (Math.abs(third) <= epsilon && onSegment(secondStart, firstStart, secondEnd)) ||
+                (Math.abs(fourth) <= epsilon && onSegment(secondStart, firstEnd, secondEnd));
+        }
+
+        function strokeIntersectsLasso(stroke, lasso, viewport) {
+            const points = stroke.points.map(pdfPoint => {
+                const [x, y] = viewport.convertToViewportPoint(pdfPoint.x, pdfPoint.y);
+                return { x, y };
+            });
+            if (points.some(point => pointInPolygon(point, lasso))) return true;
+
+            for (let strokeIndex = 1; strokeIndex < points.length; strokeIndex++) {
+                for (let lassoIndex = 0; lassoIndex < lasso.length; lassoIndex++) {
+                    if (segmentsIntersect(
+                        points[strokeIndex - 1],
+                        points[strokeIndex],
+                        lasso[lassoIndex],
+                        lasso[(lassoIndex + 1) % lasso.length]
+                    )) return true;
+                }
+            }
+            return false;
+        }
+
         function addDrawingHandlers(canvas, pageIndex, viewport, pixelRatio) {
             const context = canvas.getContext("2d");
             let activePointerId;
             let isErasingPointer = false;
+            let isSelectingPointer = false;
             let stroke;
             let lastEraserPoint;
+            let lassoPoints;
+            let selectedStrokeOrigins;
+            let dragStart;
 
             function getPosition(event) {
                 const bounds = canvas.getBoundingClientRect();
@@ -399,17 +512,42 @@
             }
 
             canvas.addEventListener("pointerdown", function(event) {
-                if ((!isDrawing && !isErasing) || isUpdating ||
+                if ((!isDrawing && !isErasing && !isSelecting) || isUpdating ||
                     !event.isPrimary || activePointerId !== undefined) return;
                 event.preventDefault();
                 activePointerId = event.pointerId;
                 canvas.setPointerCapture(event.pointerId);
                 isErasingPointer = isErasing;
+                isSelectingPointer = isSelecting;
                 activeStrokeCount++;
                 updatePageControls();
                 if (isErasingPointer) {
                     lastEraserPoint = getPosition(event);
                     eraseAt(pageIndex, lastEraserPoint, viewport, pixelRatio);
+                    return;
+                }
+                if (isSelectingPointer) {
+                    const point = getPosition(event);
+                    const selected = selectedStrokesByPage[pageIndex] || new Set();
+                    const hitStroke = [...selected].find(selectedStroke =>
+                        strokeContainsPoint(selectedStroke, point, viewport)
+                    );
+                    if (hitStroke) {
+                        selectedStrokeOrigins = new Map(
+                            [...selected].map(selectedStroke => [
+                                selectedStroke,
+                                selectedStroke.points.map(pdfPoint => ({ ...pdfPoint }))
+                            ])
+                        );
+                        dragStart = point;
+                    } else {
+                        selectedStrokesByPage[pageIndex] = new Set();
+                        selectedStrokeOrigins = undefined;
+                        dragStart = undefined;
+                        lassoPoints = [point];
+                        redrawInk(context, pageIndex, viewport, pixelRatio);
+                        drawLasso(context, lassoPoints);
+                    }
                     return;
                 }
 
@@ -446,6 +584,30 @@
                     lastEraserPoint = point;
                     return;
                 }
+                if (isSelectingPointer) {
+                    if (selectedStrokeOrigins) {
+                        const deltaX = point.pdfX - dragStart.pdfX;
+                        const deltaY = point.pdfY - dragStart.pdfY;
+                        selectedStrokeOrigins.forEach((origins, selectedStroke) => {
+                            selectedStroke.points = origins.map(origin => ({
+                                x: origin.x + deltaX,
+                                y: origin.y + deltaY
+                            }));
+                        });
+                        redrawInk(
+                            context,
+                            pageIndex,
+                            viewport,
+                            pixelRatio,
+                            selectedStrokesByPage[pageIndex]
+                        );
+                    } else {
+                        lassoPoints.push(point);
+                        redrawInk(context, pageIndex, viewport, pixelRatio);
+                        drawLasso(context, lassoPoints);
+                    }
+                    return;
+                }
                 if (!stroke) return;
 
                 const previousPoint = stroke.points[stroke.points.length - 1];
@@ -467,6 +629,34 @@
                     activePointerId = undefined;
                     lastEraserPoint = undefined;
                     isErasingPointer = false;
+                    activeStrokeCount--;
+                    updatePageControls();
+                    return;
+                }
+                if (isSelectingPointer) {
+                    if (selectedStrokeOrigins) {
+                        status.textContent =
+                            `Moved ${selectedStrokeOrigins.size} selected drawing${selectedStrokeOrigins.size === 1 ? "" : "s"}.`;
+                    } else {
+                        const selection = new Set();
+                        if (lassoPoints.length > 2) {
+                            (drawingsByPage[pageIndex] || []).forEach(candidate => {
+                                if (strokeIntersectsLasso(candidate, lassoPoints, viewport)) {
+                                    selection.add(candidate);
+                                }
+                            });
+                        }
+                        selectedStrokesByPage[pageIndex] = selection;
+                        redrawInk(context, pageIndex, viewport, pixelRatio, selection);
+                        status.textContent = selection.size
+                            ? `${selection.size} drawing${selection.size === 1 ? "" : "s"} selected. Drag a selected drawing to move it.`
+                            : "No drawings selected.";
+                    }
+                    activePointerId = undefined;
+                    isSelectingPointer = false;
+                    lassoPoints = undefined;
+                    selectedStrokeOrigins = undefined;
+                    dragStart = undefined;
                     activeStrokeCount--;
                     updatePageControls();
                     return;
@@ -530,6 +720,7 @@
 
         function eraseAt(pageIndex, position, viewport, pixelRatio) {
             const strokes = drawingsByPage[pageIndex] || [];
+            const selectedStrokes = selectedStrokesByPage[pageIndex] || new Set();
             const eraserRadius = 12;
             let erasedCount = 0;
             const remainingStrokes = strokes.filter(stroke => {
@@ -541,6 +732,7 @@
                 if (points.length === 1) {
                     if (Math.hypot(position.x - points[0].x, position.y - points[0].y) <= hitRadius) {
                         erasedCount++;
+                        selectedStrokes.delete(stroke);
                         return false;
                     }
                     return true;
@@ -548,6 +740,7 @@
                 for (let pointIndex = 1; pointIndex < points.length; pointIndex++) {
                     if (distanceToSegment(position, points[pointIndex - 1], points[pointIndex]) <= hitRadius) {
                         erasedCount++;
+                        selectedStrokes.delete(stroke);
                         return false;
                     }
                 }
@@ -563,7 +756,8 @@
                     inkCanvas.getContext("2d"),
                     pageIndex,
                     viewport,
-                    window.devicePixelRatio || 1
+                    window.devicePixelRatio || 1,
+                    selectedStrokes
                 );
             }
             status.textContent = `${erasedCount} drawing${erasedCount === 1 ? "" : "s"} erased.`;
@@ -606,16 +800,21 @@
                 pdfDocument = await PDFLib.PDFDocument.load(await file.arrayBuffer());
                 pdfFileName = file.name.replace(/\.pdf$/i, "") + "-annotated.pdf";
                 drawingsByPage = Array.from({ length: pdfDocument.getPageCount() }, () => []);
+                selectedStrokesByPage = Array.from({ length: pdfDocument.getPageCount() }, () => new Set());
                 currentPageIndex = 0;
                 zoom = 1;
                 drawToggle.setAttribute("aria-pressed", "false");
                 drawToggle.textContent = "Draw";
                 eraseToggle.setAttribute("aria-pressed", "false");
                 eraseToggle.textContent = "Erase";
+                selectToggle.setAttribute("aria-pressed", "false");
+                selectToggle.textContent = "Lasso select";
                 isDrawing = false;
                 isErasing = false;
+                isSelecting = false;
                 pdfViewer.classList.remove("drawing");
                 pdfViewer.classList.remove("erasing");
+                pdfViewer.classList.remove("selecting");
                 viewerToolbar.hidden = false;
                 pdfViewer.hidden = false;
                 pageEditorToggle.disabled = false;
@@ -656,23 +855,46 @@
         drawToggle.addEventListener("click", function() {
             isDrawing = !isDrawing;
             isErasing = false;
+            isSelecting = false;
             drawToggle.setAttribute("aria-pressed", String(isDrawing));
             drawToggle.textContent = isDrawing ? "Stop drawing" : "Draw";
             eraseToggle.setAttribute("aria-pressed", "false");
             eraseToggle.textContent = "Erase";
+            selectToggle.setAttribute("aria-pressed", "false");
+            selectToggle.textContent = "Lasso select";
             pdfViewer.classList.toggle("drawing", isDrawing);
             pdfViewer.classList.remove("erasing");
+            pdfViewer.classList.remove("selecting");
         });
 
         eraseToggle.addEventListener("click", function() {
             isErasing = !isErasing;
             isDrawing = false;
+            isSelecting = false;
             eraseToggle.setAttribute("aria-pressed", String(isErasing));
             eraseToggle.textContent = isErasing ? "Stop erasing" : "Erase";
             drawToggle.setAttribute("aria-pressed", "false");
             drawToggle.textContent = "Draw";
+            selectToggle.setAttribute("aria-pressed", "false");
+            selectToggle.textContent = "Lasso select";
             pdfViewer.classList.toggle("erasing", isErasing);
             pdfViewer.classList.remove("drawing");
+            pdfViewer.classList.remove("selecting");
+        });
+
+        selectToggle.addEventListener("click", function() {
+            isSelecting = !isSelecting;
+            isDrawing = false;
+            isErasing = false;
+            selectToggle.setAttribute("aria-pressed", String(isSelecting));
+            selectToggle.textContent = isSelecting ? "Stop selecting" : "Lasso select";
+            drawToggle.setAttribute("aria-pressed", "false");
+            drawToggle.textContent = "Draw";
+            eraseToggle.setAttribute("aria-pressed", "false");
+            eraseToggle.textContent = "Erase";
+            pdfViewer.classList.toggle("selecting", isSelecting);
+            pdfViewer.classList.remove("drawing");
+            pdfViewer.classList.remove("erasing");
         });
 
         inkThickness.addEventListener("input", function() {
@@ -721,6 +943,7 @@
                     const { width, height } = pageToCopy.getSize();
                     pdfDocument.insertPage(pageIndex + 1, [width, height]);
                     drawingsByPage.splice(pageIndex + 1, 0, []);
+                    selectedStrokesByPage.splice(pageIndex + 1, 0, new Set());
                     await updateDocument(pageIndex + 1);
                 } catch (error) {
                     status.textContent = `Unable to add a page: ${error.message}`;
@@ -732,6 +955,7 @@
                 try {
                     pdfDocument.removePage(pageIndex);
                     drawingsByPage.splice(pageIndex, 1);
+                    selectedStrokesByPage.splice(pageIndex, 1);
                     await updateDocument(Math.min(pageIndex, pdfDocument.getPageCount() - 1));
                 } catch (error) {
                     status.textContent = `Unable to remove a page: ${error.message}`;
