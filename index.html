@@ -1,29 +1,743 @@
-
 <!DOCTYPE html>
 <html>
 <head>
     <title>PDF Viewer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+
+        #viewerToolbar {
+            align-items: center;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin: 12px 0;
+        }
+
+        #viewerToolbar[hidden] {
+            display: none;
+        }
+
+        #pdfViewer {
+            background: #e5e5e5;
+            height: 70vh;
+            min-height: 300px;
+            overflow: auto;
+            padding: 16px;
+            position: relative;
+        }
+
+        .pdf-page {
+            margin: 0 auto 16px;
+            position: relative;
+            width: fit-content;
+        }
+
+        .pdf-page canvas {
+            background: white;
+            box-shadow: 0 1px 5px #0003;
+            display: block;
+        }
+
+        .pdf-page .ink-layer {
+            background: transparent;
+            box-shadow: none;
+            display: block;
+            height: 100%;
+            left: 0;
+            position: absolute;
+            top: 0;
+            touch-action: auto;
+            width: 100%;
+            z-index: 1;
+        }
+
+        #pdfViewer.drawing .ink-layer {
+            cursor: crosshair;
+            touch-action: none;
+        }
+
+        #pdfViewer.erasing .ink-layer {
+            cursor: cell;
+            touch-action: none;
+        }
+
+        #inkColor {
+            border: 0;
+            border-radius: 50%;
+            cursor: pointer;
+            height: 36px;
+            padding: 2px;
+            width: 36px;
+        }
+
+        #inkThickness {
+            width: 120px;
+        }
+
+        #downloadPdf {
+            margin-left: auto;
+        }
+
+        .page-editor-control {
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 120ms ease;
+            visibility: hidden;
+        }
+
+        #pdfViewer.editing .page-editor-control {
+            opacity: 1;
+            pointer-events: auto;
+            visibility: visible;
+        }
+
+        .page-remove {
+            position: absolute;
+            right: 8px;
+            top: 8px;
+            z-index: 2;
+        }
+
+        .page-add {
+            display: block;
+            margin: 8px auto 0;
+            position: relative;
+            z-index: 2;
+        }
+
+        .pdf-render-page {
+            left: 16px;
+            opacity: 0;
+            pointer-events: none;
+            position: absolute;
+            top: 16px;
+        }
+
+        #pageEditor {
+            margin-top: 8px;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .page-editor-control {
+                transition: none;
+            }
+        }
+    </style>
 </head>
 <body>
-
     <h2>PDF Viewer</h2>
-
     <input type="file" id="pdfUpload" accept=".pdf,application/pdf">
 
-    <br><br>
+    <div id="viewerToolbar" hidden>
+        <button id="zoomOut" type="button" aria-label="Zoom out">−</button>
+        <span id="zoomLevel">100%</span>
+        <button id="zoomIn" type="button" aria-label="Zoom in">+</button>
+        <span id="currentPage" aria-live="polite"></span>
+        <button id="drawToggle" type="button" aria-pressed="false">Draw</button>
+        <button id="eraseToggle" type="button" aria-pressed="false">Erase</button>
+        <label for="inkColor">Color</label>
+        <input id="inkColor" type="color" value="#e53935" aria-label="Drawing color">
+        <label for="inkThickness">Thickness</label>
+        <input id="inkThickness" type="range" min="1" max="12" step="0.5" value="2">
+        <output id="inkThicknessValue" for="inkThickness">2 pt</output>
+        <button id="downloadPdf" type="button">Download PDF</button>
+    </div>
+    <div id="pdfViewer" aria-label="PDF pages" hidden></div>
 
-    <iframe id="pdfViewer" width="100%" height="600px"></iframe>
+    <br>
+    <button id="pageEditorToggle" type="button" aria-expanded="false" disabled>Edit pages</button>
+    <div id="pageEditor" hidden>
+        <span id="pageCount" aria-live="polite"></span>
+    </div>
+    <p id="status" role="status" aria-live="polite"></p>
 
+    <script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <script>
-        document.getElementById("pdfUpload").addEventListener("change", function(event) {
-            const file = event.target.files[0];
+        const pdfUpload = document.getElementById("pdfUpload");
+        const pdfViewer = document.getElementById("pdfViewer");
+        const viewerToolbar = document.getElementById("viewerToolbar");
+        const zoomOutButton = document.getElementById("zoomOut");
+        const zoomInButton = document.getElementById("zoomIn");
+        const zoomLevel = document.getElementById("zoomLevel");
+        const currentPageLabel = document.getElementById("currentPage");
+        const drawToggle = document.getElementById("drawToggle");
+        const eraseToggle = document.getElementById("eraseToggle");
+        const inkColor = document.getElementById("inkColor");
+        const inkThickness = document.getElementById("inkThickness");
+        const inkThicknessValue = document.getElementById("inkThicknessValue");
+        const downloadPdfButton = document.getElementById("downloadPdf");
+        const pageEditorToggle = document.getElementById("pageEditorToggle");
+        const pageEditor = document.getElementById("pageEditor");
+        const pageCount = document.getElementById("pageCount");
+        const status = document.getElementById("status");
+        const minZoom = 0.4;
+        const maxZoom = 2.5;
+        let pdfDocument;
+        let zoom = 1;
+        let currentPageIndex = 0;
+        let renderGeneration = 0;
+        let isUpdating = false;
+        let isDrawing = false;
+        let isErasing = false;
+        let activeStrokeCount = 0;
+        let drawingsByPage = [];
+        let pdfFileName = "annotated.pdf";
 
-            if (file && file.type === "application/pdf") {
-                const url = URL.createObjectURL(file);
-                document.getElementById("pdfViewer").src = url;
+        pdfjsLib.GlobalWorkerOptions.workerSrc =
+            "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+        function updatePageControls() {
+            const count = pdfDocument.getPageCount();
+            if (!isUpdating || !pageCount.textContent) {
+                pageCount.textContent = `${count} page${count === 1 ? "" : "s"}`;
+            }
+            if (!isUpdating || !currentPageLabel.textContent) {
+                currentPageLabel.textContent = `Page ${currentPageIndex + 1} of ${count}`;
+            }
+            zoomOutButton.disabled = isUpdating || activeStrokeCount > 0 || zoom <= minZoom;
+            zoomInButton.disabled = isUpdating || activeStrokeCount > 0 || zoom >= maxZoom;
+            drawToggle.disabled = isUpdating || activeStrokeCount > 0;
+            eraseToggle.disabled = isUpdating || activeStrokeCount > 0;
+            downloadPdfButton.disabled = isUpdating || activeStrokeCount > 0;
+            zoomLevel.textContent = `${Math.round(zoom * 100)}%`;
+            pdfViewer.querySelectorAll(".page-editor-control").forEach(button => {
+                button.disabled = isUpdating || activeStrokeCount > 0 ||
+                    (button.classList.contains("page-remove") && count <= 1);
+            });
+        }
+
+        function findCurrentPageIndex() {
+            const pages = pdfViewer.querySelectorAll(".pdf-page:not(.pdf-render-page)");
+            if (!pages.length) return currentPageIndex;
+
+            const viewerCenter = pdfViewer.getBoundingClientRect().top + pdfViewer.clientHeight / 2;
+            let closestIndex = 0;
+            let closestDistance = Infinity;
+
+            pages.forEach((page, index) => {
+                const bounds = page.getBoundingClientRect();
+                const pageCenter = bounds.top + bounds.height / 2;
+                const distance = Math.abs(viewerCenter - pageCenter);
+                if (distance < closestDistance) {
+                    closestDistance = distance;
+                    closestIndex = index;
+                }
+            });
+
+            return closestIndex;
+        }
+
+        function updateCurrentPage() {
+            if (!pdfDocument) return;
+            currentPageIndex = findCurrentPageIndex();
+            updatePageControls();
+        }
+
+        async function renderPages(targetPageIndex = currentPageIndex) {
+            const generation = ++renderGeneration;
+            const existingPages = pdfViewer.querySelectorAll(".pdf-page:not(.pdf-render-page)");
+            const anchorIndex = Math.min(targetPageIndex, existingPages.length - 1);
+            const anchorTop = anchorIndex >= 0
+                ? existingPages[anchorIndex].getBoundingClientRect().top
+                : undefined;
+            const stagedPages = [];
+            const pdfBytes = await saveAndRefreshDocument();
+            if (generation !== renderGeneration) return;
+
+            const loadingTask = pdfjsLib.getDocument({
+                data: new Uint8Array(pdfBytes)
+            });
+            const renderedDocument = await loadingTask.promise;
+
+            if (generation !== renderGeneration) return;
+
+            try {
+                for (let index = 0; index < renderedDocument.numPages; index++) {
+                    const page = await renderedDocument.getPage(index + 1);
+                    if (generation !== renderGeneration) return;
+
+                    const viewport = page.getViewport({ scale: zoom });
+                    const wrapper = document.createElement("div");
+                    const canvas = document.createElement("canvas");
+                    const inkCanvas = document.createElement("canvas");
+                    const removeButton = document.createElement("button");
+                    const addButton = document.createElement("button");
+                    const context = canvas.getContext("2d");
+                    const inkContext = inkCanvas.getContext("2d");
+                    const pixelRatio = window.devicePixelRatio || 1;
+                    wrapper.className = "pdf-page pdf-render-page";
+                    wrapper.dataset.pageIndex = String(index);
+                    canvas.width = Math.ceil(viewport.width);
+                    canvas.height = Math.ceil(viewport.height);
+                    inkCanvas.className = "ink-layer";
+                    inkCanvas.width = Math.ceil(viewport.width * pixelRatio);
+                    inkCanvas.height = Math.ceil(viewport.height * pixelRatio);
+                    inkCanvas.style.width = `${viewport.width}px`;
+                    inkCanvas.style.height = `${viewport.height}px`;
+                    inkContext.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+                    removeButton.className = "page-editor-control page-remove";
+                    removeButton.type = "button";
+                    removeButton.dataset.pageIndex = String(index);
+                    removeButton.setAttribute("aria-label", `Remove page ${index + 1}`);
+                    removeButton.textContent = "−";
+                    addButton.className = "page-editor-control page-add";
+                    addButton.type = "button";
+                    addButton.dataset.pageIndex = String(index);
+                    addButton.setAttribute("aria-label", `Add a page after page ${index + 1}`);
+                    addButton.textContent = "+";
+                    wrapper.appendChild(canvas);
+                    wrapper.appendChild(inkCanvas);
+                    wrapper.appendChild(removeButton);
+                    wrapper.appendChild(addButton);
+                    pdfViewer.appendChild(wrapper);
+                    stagedPages.push(wrapper);
+                    await page.render({ canvasContext: context, viewport }).promise;
+                    redrawInk(inkContext, index, viewport, pixelRatio);
+                    addDrawingHandlers(inkCanvas, index, viewport, pixelRatio);
+                }
+
+                if (generation !== renderGeneration) return;
+
+                currentPageIndex = Math.min(targetPageIndex, renderedDocument.numPages - 1);
+                stagedPages.forEach(page => page.classList.remove("pdf-render-page"));
+                pdfViewer.replaceChildren(...stagedPages);
+                stagedPages.length = 0;
+                if (anchorTop !== undefined) {
+                    const newAnchorTop = pdfViewer.children[currentPageIndex].getBoundingClientRect().top;
+                    pdfViewer.scrollTop += newAnchorTop - anchorTop;
+                }
+                updatePageControls();
+            } finally {
+                stagedPages.forEach(page => page.remove());
+            }
+        }
+
+        async function saveAndRefreshDocument() {
+            const pdfBytes = await pdfDocument.save();
+            const refreshedDocument = await PDFLib.PDFDocument.load(pdfBytes);
+            pdfDocument = refreshedDocument;
+            return pdfBytes;
+        }
+
+        async function updateDocument(targetPageIndex) {
+            if (activeStrokeCount > 0) {
+                status.textContent = "Finish the current stroke before changing the page view.";
+                return;
+            }
+
+            isUpdating = true;
+            updatePageControls();
+            try {
+                await renderPages(targetPageIndex);
+                status.textContent = "";
+            } catch (error) {
+                status.textContent = `Unable to update the PDF: ${error.message}`;
+            } finally {
+                isUpdating = false;
+                updatePageControls();
+            }
+        }
+
+        function parseColor(color) {
+            return PDFLib.rgb(
+                parseInt(color.slice(1, 3), 16) / 255,
+                parseInt(color.slice(3, 5), 16) / 255,
+                parseInt(color.slice(5, 7), 16) / 255
+            );
+        }
+
+        function redrawInk(context, pageIndex, viewport, pixelRatio) {
+            context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+            context.clearRect(0, 0, context.canvas.width, context.canvas.height);
+
+            (drawingsByPage[pageIndex] || []).forEach(stroke => {
+                const points = stroke.points.map(point =>
+                    viewport.convertToViewportPoint(point.x, point.y)
+                );
+                context.beginPath();
+                if (points.length === 1) {
+                    context.arc(
+                        points[0][0],
+                        points[0][1],
+                        stroke.thickness * viewport.scale / 2,
+                        0,
+                        Math.PI * 2
+                    );
+                    context.fillStyle = stroke.color;
+                    context.fill();
+                    return;
+                }
+
+                context.moveTo(points[0][0], points[0][1]);
+                points.slice(1).forEach(point => context.lineTo(point[0], point[1]));
+                context.strokeStyle = stroke.color;
+                context.lineWidth = stroke.thickness * viewport.scale;
+                context.lineCap = "round";
+                context.lineJoin = "round";
+                context.stroke();
+            });
+        }
+
+        function addDrawingHandlers(canvas, pageIndex, viewport, pixelRatio) {
+            const context = canvas.getContext("2d");
+            let activePointerId;
+            let isErasingPointer = false;
+            let stroke;
+            let lastEraserPoint;
+
+            function getPosition(event) {
+                const bounds = canvas.getBoundingClientRect();
+                const x = (event.clientX - bounds.left) * viewport.width / bounds.width;
+                const y = (event.clientY - bounds.top) * viewport.height / bounds.height;
+                const [pdfX, pdfY] = viewport.convertToPdfPoint(x, y);
+                return { x, y, pdfX, pdfY };
+            }
+
+            canvas.addEventListener("pointerdown", function(event) {
+                if ((!isDrawing && !isErasing) || isUpdating ||
+                    !event.isPrimary || activePointerId !== undefined) return;
+                event.preventDefault();
+                activePointerId = event.pointerId;
+                canvas.setPointerCapture(event.pointerId);
+                isErasingPointer = isErasing;
+                activeStrokeCount++;
+                updatePageControls();
+                if (isErasingPointer) {
+                    lastEraserPoint = getPosition(event);
+                    eraseAt(pageIndex, lastEraserPoint, viewport, pixelRatio);
+                    return;
+                }
+
+                const point = getPosition(event);
+                stroke = {
+                    color: inkColor.value,
+                    thickness: Number(inkThickness.value),
+                    points: [point]
+                };
+                context.beginPath();
+                context.arc(point.x, point.y, stroke.thickness * viewport.scale / 2, 0, Math.PI * 2);
+                context.fillStyle = stroke.color;
+                context.fill();
+            });
+
+            canvas.addEventListener("pointermove", function(event) {
+                if (event.pointerId !== activePointerId) return;
+                event.preventDefault();
+                const point = getPosition(event);
+                if (isErasingPointer) {
+                    const distance = Math.hypot(
+                        point.x - lastEraserPoint.x,
+                        point.y - lastEraserPoint.y
+                    );
+                    const steps = Math.max(1, Math.ceil(distance / 8));
+                    for (let step = 1; step <= steps; step++) {
+                        const ratio = step / steps;
+                        eraseAt(pageIndex, {
+                            ...point,
+                            x: lastEraserPoint.x + (point.x - lastEraserPoint.x) * ratio,
+                            y: lastEraserPoint.y + (point.y - lastEraserPoint.y) * ratio
+                        }, viewport, pixelRatio);
+                    }
+                    lastEraserPoint = point;
+                    return;
+                }
+                if (!stroke) return;
+
+                const previousPoint = stroke.points[stroke.points.length - 1];
+                stroke.points.push(point);
+                context.beginPath();
+                context.moveTo(previousPoint.x, previousPoint.y);
+                context.lineTo(point.x, point.y);
+                context.strokeStyle = stroke.color;
+                context.lineWidth = stroke.thickness * viewport.scale;
+                context.lineCap = "round";
+                context.lineJoin = "round";
+                context.stroke();
+            });
+
+            async function finishStroke(event) {
+                if (event.pointerId !== activePointerId) return;
+                event.preventDefault();
+                if (isErasingPointer) {
+                    activePointerId = undefined;
+                    lastEraserPoint = undefined;
+                    isErasingPointer = false;
+                    activeStrokeCount--;
+                    updatePageControls();
+                    return;
+                }
+                if (!stroke) return;
+
+                const completedStroke = stroke;
+                const finalPoint = getPosition(event);
+                const previousPoint = completedStroke.points[completedStroke.points.length - 1];
+                if (finalPoint.x !== previousPoint.x || finalPoint.y !== previousPoint.y) {
+                    completedStroke.points.push(finalPoint);
+                    context.beginPath();
+                    context.moveTo(previousPoint.x, previousPoint.y);
+                    context.lineTo(finalPoint.x, finalPoint.y);
+                    context.strokeStyle = completedStroke.color;
+                    context.lineWidth = completedStroke.thickness * viewport.scale;
+                    context.lineCap = "round";
+                    context.lineJoin = "round";
+                    context.stroke();
+                }
+                stroke = undefined;
+                activePointerId = undefined;
+
+                try {
+                    const savedStroke = {
+                        color: completedStroke.color,
+                        thickness: completedStroke.thickness,
+                        points: completedStroke.points.map(point => ({ x: point.pdfX, y: point.pdfY }))
+                    };
+                    const strokes = drawingsByPage[pageIndex] || [];
+                    strokes.push(savedStroke);
+                    drawingsByPage[pageIndex] = strokes;
+                    status.textContent = "Drawing added. Download the PDF to save your changes.";
+                } catch (error) {
+                    status.textContent = `Unable to add drawing: ${error.message}`;
+                } finally {
+                    isErasingPointer = false;
+                    activeStrokeCount--;
+                    updatePageControls();
+                }
+            }
+
+            canvas.addEventListener("pointerup", finishStroke);
+            canvas.addEventListener("pointercancel", finishStroke);
+        }
+
+        function distanceToSegment(point, start, end) {
+            const deltaX = end.x - start.x;
+            const deltaY = end.y - start.y;
+            const lengthSquared = deltaX * deltaX + deltaY * deltaY;
+            if (lengthSquared === 0) return Math.hypot(point.x - start.x, point.y - start.y);
+
+            const projection = Math.max(0, Math.min(1,
+                ((point.x - start.x) * deltaX + (point.y - start.y) * deltaY) / lengthSquared
+            ));
+            return Math.hypot(
+                point.x - (start.x + projection * deltaX),
+                point.y - (start.y + projection * deltaY)
+            );
+        }
+
+        function eraseAt(pageIndex, position, viewport, pixelRatio) {
+            const strokes = drawingsByPage[pageIndex] || [];
+            const eraserRadius = 12;
+            let erasedCount = 0;
+            const remainingStrokes = strokes.filter(stroke => {
+                const points = stroke.points.map(point => {
+                    const [x, y] = viewport.convertToViewportPoint(point.x, point.y);
+                    return { x, y };
+                });
+                const hitRadius = eraserRadius + stroke.thickness * viewport.scale / 2;
+                if (points.length === 1) {
+                    if (Math.hypot(position.x - points[0].x, position.y - points[0].y) <= hitRadius) {
+                        erasedCount++;
+                        return false;
+                    }
+                    return true;
+                }
+                for (let pointIndex = 1; pointIndex < points.length; pointIndex++) {
+                    if (distanceToSegment(position, points[pointIndex - 1], points[pointIndex]) <= hitRadius) {
+                        erasedCount++;
+                        return false;
+                    }
+                }
+                return true;
+            });
+            if (erasedCount === 0) return;
+
+            drawingsByPage[pageIndex] = remainingStrokes;
+            const page = pdfViewer.querySelector(`.pdf-page[data-page-index="${pageIndex}"]`);
+            if (page) {
+                const inkCanvas = page.querySelector(".ink-layer");
+                redrawInk(
+                    inkCanvas.getContext("2d"),
+                    pageIndex,
+                    viewport,
+                    window.devicePixelRatio || 1
+                );
+            }
+            status.textContent = `${erasedCount} drawing${erasedCount === 1 ? "" : "s"} erased.`;
+        }
+
+        function drawStrokesOnPdf(page, strokes) {
+            strokes.forEach(stroke => {
+                const color = parseColor(stroke.color);
+                if (stroke.points.length === 1) {
+                    page.drawCircle({
+                        x: stroke.points[0].x,
+                        y: stroke.points[0].y,
+                        size: stroke.thickness / 2,
+                        color
+                    });
+                    return;
+                }
+
+                for (let index = 1; index < stroke.points.length; index++) {
+                    page.drawLine({
+                        start: stroke.points[index - 1],
+                        end: stroke.points[index],
+                        thickness: stroke.thickness,
+                        color
+                    });
+                }
+            });
+        }
+
+        pdfUpload.addEventListener("change", async function(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
+                status.textContent = "Please choose a PDF file.";
+                return;
+            }
+
+            try {
+                pdfDocument = await PDFLib.PDFDocument.load(await file.arrayBuffer());
+                pdfFileName = file.name.replace(/\.pdf$/i, "") + "-annotated.pdf";
+                drawingsByPage = Array.from({ length: pdfDocument.getPageCount() }, () => []);
+                currentPageIndex = 0;
+                zoom = 1;
+                drawToggle.setAttribute("aria-pressed", "false");
+                drawToggle.textContent = "Draw";
+                eraseToggle.setAttribute("aria-pressed", "false");
+                eraseToggle.textContent = "Erase";
+                isDrawing = false;
+                isErasing = false;
+                pdfViewer.classList.remove("drawing");
+                pdfViewer.classList.remove("erasing");
+                viewerToolbar.hidden = false;
+                pdfViewer.hidden = false;
+                pageEditorToggle.disabled = false;
+                await updateDocument(0);
+            } catch (error) {
+                pdfDocument = undefined;
+                pdfViewer.replaceChildren();
+                pdfViewer.hidden = true;
+                viewerToolbar.hidden = true;
+                pageEditorToggle.disabled = true;
+                status.textContent = `Unable to open this PDF: ${error.message}`;
+            }
+        });
+
+        pdfViewer.addEventListener("scroll", updateCurrentPage, { passive: true });
+
+        zoomOutButton.addEventListener("click", async function() {
+            if (zoom <= minZoom || isUpdating) return;
+            currentPageIndex = findCurrentPageIndex();
+            zoom = Math.max(minZoom, Math.round((zoom - 0.2) * 10) / 10);
+            await updateDocument(currentPageIndex);
+        });
+
+        zoomInButton.addEventListener("click", async function() {
+            if (zoom >= maxZoom || isUpdating) return;
+            currentPageIndex = findCurrentPageIndex();
+            zoom = Math.min(maxZoom, Math.round((zoom + 0.2) * 10) / 10);
+            await updateDocument(currentPageIndex);
+        });
+
+        pageEditorToggle.addEventListener("click", function() {
+            const isExpanded = pageEditorToggle.getAttribute("aria-expanded") === "true";
+            pageEditor.hidden = isExpanded;
+            pdfViewer.classList.toggle("editing", !isExpanded);
+            pageEditorToggle.setAttribute("aria-expanded", String(!isExpanded));
+        });
+
+        drawToggle.addEventListener("click", function() {
+            isDrawing = !isDrawing;
+            isErasing = false;
+            drawToggle.setAttribute("aria-pressed", String(isDrawing));
+            drawToggle.textContent = isDrawing ? "Stop drawing" : "Draw";
+            eraseToggle.setAttribute("aria-pressed", "false");
+            eraseToggle.textContent = "Erase";
+            pdfViewer.classList.toggle("drawing", isDrawing);
+            pdfViewer.classList.remove("erasing");
+        });
+
+        eraseToggle.addEventListener("click", function() {
+            isErasing = !isErasing;
+            isDrawing = false;
+            eraseToggle.setAttribute("aria-pressed", String(isErasing));
+            eraseToggle.textContent = isErasing ? "Stop erasing" : "Erase";
+            drawToggle.setAttribute("aria-pressed", "false");
+            drawToggle.textContent = "Draw";
+            pdfViewer.classList.toggle("erasing", isErasing);
+            pdfViewer.classList.remove("drawing");
+        });
+
+        inkThickness.addEventListener("input", function() {
+            inkThicknessValue.value = `${inkThickness.value} pt`;
+            inkThicknessValue.textContent = `${inkThickness.value} pt`;
+        });
+
+        downloadPdfButton.addEventListener("click", async function() {
+            if (!pdfDocument || isUpdating || activeStrokeCount > 0) {
+                status.textContent = "Finish the current stroke before downloading the PDF.";
+                return;
+            }
+
+            downloadPdfButton.disabled = true;
+            try {
+                const exportDocument = await PDFLib.PDFDocument.load(await pdfDocument.save());
+                drawingsByPage.forEach((strokes, pageIndex) => {
+                    const page = exportDocument.getPage(pageIndex);
+                    drawStrokesOnPdf(page, strokes);
+                });
+                const pdfBytes = await exportDocument.save();
+                const downloadUrl = URL.createObjectURL(
+                    new Blob([pdfBytes], { type: "application/pdf" })
+                );
+                const link = document.createElement("a");
+                link.href = downloadUrl;
+                link.download = pdfFileName;
+                link.click();
+                setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+                status.textContent = `Downloaded ${pdfFileName}.`;
+            } catch (error) {
+                status.textContent = `Unable to download the PDF: ${error.message}`;
+            } finally {
+                downloadPdfButton.disabled = false;
+            }
+        });
+
+        pdfViewer.addEventListener("click", async function(event) {
+            const button = event.target.closest(".page-editor-control");
+            if (!button || !pdfDocument || isUpdating) return;
+
+            const pageIndex = Number(button.dataset.pageIndex);
+            if (button.classList.contains("page-add")) {
+                try {
+                    const pageToCopy = pdfDocument.getPage(pageIndex);
+                    const { width, height } = pageToCopy.getSize();
+                    pdfDocument.insertPage(pageIndex + 1, [width, height]);
+                    drawingsByPage.splice(pageIndex + 1, 0, []);
+                    await updateDocument(pageIndex + 1);
+                } catch (error) {
+                    status.textContent = `Unable to add a page: ${error.message}`;
+                }
+                return;
+            }
+
+            if (button.classList.contains("page-remove") && pdfDocument.getPageCount() > 1) {
+                try {
+                    pdfDocument.removePage(pageIndex);
+                    drawingsByPage.splice(pageIndex, 1);
+                    await updateDocument(Math.min(pageIndex, pdfDocument.getPageCount() - 1));
+                } catch (error) {
+                    status.textContent = `Unable to remove a page: ${error.message}`;
+                }
             }
         });
     </script>
-
 </body>
 </html>
