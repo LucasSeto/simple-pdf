@@ -186,6 +186,8 @@
         <button id="zoomOut" type="button" aria-label="Zoom out">−</button>
         <span id="zoomLevel">100%</span>
         <button id="zoomIn" type="button" aria-label="Zoom in">+</button>
+        <button id="undo" type="button" aria-label="Undo" disabled>Undo</button>
+        <button id="redo" type="button" aria-label="Redo" disabled>Redo</button>
         <span id="currentPage" aria-live="polite"></span>
         <button id="drawToggle" type="button" aria-pressed="false">Draw</button>
         <button id="eraseToggle" type="button" aria-pressed="false">Erase</button>
@@ -216,6 +218,8 @@
         const viewerToolbar = document.getElementById("viewerToolbar");
         const zoomOutButton = document.getElementById("zoomOut");
         const zoomInButton = document.getElementById("zoomIn");
+        const undoButton = document.getElementById("undo");
+        const redoButton = document.getElementById("redo");
         const zoomLevel = document.getElementById("zoomLevel");
         const currentPageLabel = document.getElementById("currentPage");
         const drawToggle = document.getElementById("drawToggle");
@@ -233,7 +237,9 @@
         const status = document.getElementById("status");
         const minZoom = 0.4;
         const maxZoom = 2.5;
+        const maxHistoryEntries = 50;
         let pdfDocument;
+        let pdfStructureBytes;
         let zoom = 1;
         let currentPageIndex = 0;
         let renderGeneration = 0;
@@ -248,6 +254,8 @@
         let drawingsByPage = [];
         let selectedStrokesByPage = [];
         let textRunsByPage = [];
+        let undoHistory = [];
+        let redoHistory = [];
         let pdfFileName = "annotated.pdf";
 
         pdfjsLib.GlobalWorkerOptions.workerSrc =
@@ -263,6 +271,8 @@
             }
             zoomOutButton.disabled = isUpdating || activeStrokeCount > 0 || zoom <= minZoom;
             zoomInButton.disabled = isUpdating || activeStrokeCount > 0 || zoom >= maxZoom;
+            undoButton.disabled = isUpdating || activeStrokeCount > 0 || undoHistory.length === 0;
+            redoButton.disabled = isUpdating || activeStrokeCount > 0 || redoHistory.length === 0;
             drawToggle.disabled = isUpdating || activeStrokeCount > 0;
             eraseToggle.disabled = isUpdating || activeStrokeCount > 0;
             selectToggle.disabled = isUpdating || activeStrokeCount > 0;
@@ -274,6 +284,86 @@
                 button.disabled = isUpdating || activeStrokeCount > 0 ||
                     (button.classList.contains("page-remove") && count <= 1);
             });
+        }
+
+        function cloneStroke(stroke) {
+            return {
+                ...stroke,
+                points: stroke.points.map(point => ({ ...point }))
+            };
+        }
+
+        function cloneTextRun(run) {
+            return {
+                ...run,
+                transform: [...run.transform]
+            };
+        }
+
+        function captureHistoryState() {
+            const drawings = drawingsByPage.map(strokes => strokes.map(cloneStroke));
+            const selectedStrokeIndexes = selectedStrokesByPage.map((selected, pageIndex) =>
+                drawingsByPage[pageIndex].flatMap((stroke, strokeIndex) =>
+                    selected.has(stroke) ? [strokeIndex] : []
+                )
+            );
+            return {
+                pdfBytes: pdfStructureBytes,
+                drawings,
+                selectedStrokeIndexes,
+                textRuns: textRunsByPage.map(runs =>
+                    runs ? runs.map(cloneTextRun) : undefined
+                ),
+                currentPageIndex
+            };
+        }
+
+        function recordHistory(state) {
+            undoHistory.push(state);
+            if (undoHistory.length > maxHistoryEntries) undoHistory.shift();
+            redoHistory = [];
+            updatePageControls();
+        }
+
+        async function restoreHistoryState(state) {
+            pdfDocument = await PDFLib.PDFDocument.load(state.pdfBytes);
+            pdfStructureBytes = state.pdfBytes;
+            drawingsByPage = state.drawings.map(strokes => strokes.map(cloneStroke));
+            selectedStrokesByPage = state.selectedStrokeIndexes.map((indexes, pageIndex) =>
+                new Set(indexes.map(index => drawingsByPage[pageIndex][index]))
+            );
+            textRunsByPage = state.textRuns.map(runs =>
+                runs ? runs.map(cloneTextRun) : undefined
+            );
+            currentPageIndex = Math.min(
+                state.currentPageIndex,
+                pdfDocument.getPageCount() - 1
+            );
+            await renderPages(currentPageIndex);
+        }
+
+        async function changeHistory(source, destination, action) {
+            if (!pdfDocument || isUpdating || activeStrokeCount > 0 || !source.length) return;
+
+            const target = source[source.length - 1];
+            const current = captureHistoryState();
+            isUpdating = true;
+            updatePageControls();
+            try {
+                await restoreHistoryState(target);
+                source.pop();
+                destination.push(current);
+                status.textContent = `${action} completed.`;
+            } catch (error) {
+                status.textContent = `Unable to ${action.toLowerCase()}: ${error.message}`;
+            } finally {
+                isUpdating = false;
+                updatePageControls();
+                if (pendingZoomUpdate) {
+                    pendingZoomUpdate = false;
+                    await updateDocument(currentPageIndex);
+                }
+            }
         }
 
         function findCurrentPageIndex() {
@@ -447,8 +537,24 @@
                     run.edited = run.text !== run.originalText;
                     span.classList.toggle("edited", run.edited);
                     fitSpanToText();
+                    if (textEditHistoryState) {
+                        recordHistory(textEditHistoryState);
+                        textEditHistoryState = undefined;
+                    }
+                });
+                let textEditHistoryState;
+                let textAtFocus;
+                span.addEventListener("focus", function() {
+                    textAtFocus = run.text;
+                    textEditHistoryState = captureHistoryState();
                 });
                 layer.appendChild(span);
+                span.addEventListener("blur", function() {
+                    if (textEditHistoryState && run.text !== textAtFocus) {
+                        recordHistory(textEditHistoryState);
+                    }
+                    textEditHistoryState = undefined;
+                });
             });
         }
 
@@ -569,6 +675,7 @@
             const pdfBytes = await pdfDocument.save();
             const refreshedDocument = await PDFLib.PDFDocument.load(pdfBytes);
             pdfDocument = refreshedDocument;
+            pdfStructureBytes = pdfBytes;
             return pdfBytes;
         }
 
@@ -739,6 +846,8 @@
             let activePointerId;
             let isErasingPointer = false;
             let isSelectingPointer = false;
+            let gestureHistoryState;
+            let eraseHistoryRecorded = false;
             let stroke;
             let lastEraserPoint;
             let lassoPoints;
@@ -784,6 +893,7 @@
                     edited: false,
                     newText: true
                 };
+                recordHistory(captureHistoryState());
                 textRunsByPage[pageIndex].push(newRun);
                 const textLayer = canvas.parentElement.querySelector(".text-edit-layer");
                 renderTextRuns(textLayer, pageIndex, viewport);
@@ -804,11 +914,16 @@
                 canvas.setPointerCapture(event.pointerId);
                 isErasingPointer = isErasing;
                 isSelectingPointer = isSelecting;
+                gestureHistoryState = captureHistoryState();
+                eraseHistoryRecorded = false;
                 activeStrokeCount++;
                 updatePageControls();
                 if (isErasingPointer) {
                     lastEraserPoint = getPosition(event);
-                    eraseAt(pageIndex, lastEraserPoint, viewport, pixelRatio);
+                    if (eraseAt(pageIndex, lastEraserPoint, viewport, pixelRatio)) {
+                        recordHistory(gestureHistoryState);
+                        eraseHistoryRecorded = true;
+                    }
                     return;
                 }
                 if (isSelectingPointer) {
@@ -858,13 +973,18 @@
                         point.y - lastEraserPoint.y
                     );
                     const steps = Math.max(1, Math.ceil(distance / 8));
+                    let erased = false;
                     for (let step = 1; step <= steps; step++) {
                         const ratio = step / steps;
-                        eraseAt(pageIndex, {
+                        erased = eraseAt(pageIndex, {
                             ...point,
                             x: lastEraserPoint.x + (point.x - lastEraserPoint.x) * ratio,
                             y: lastEraserPoint.y + (point.y - lastEraserPoint.y) * ratio
-                        }, viewport, pixelRatio);
+                        }, viewport, pixelRatio) || erased;
+                    }
+                    if (erased && !eraseHistoryRecorded) {
+                        recordHistory(gestureHistoryState);
+                        eraseHistoryRecorded = true;
                     }
                     lastEraserPoint = point;
                     return;
@@ -914,12 +1034,20 @@
                     activePointerId = undefined;
                     lastEraserPoint = undefined;
                     isErasingPointer = false;
+                    gestureHistoryState = undefined;
+                    eraseHistoryRecorded = false;
                     activeStrokeCount--;
                     updatePageControls();
                     return;
                 }
                 if (isSelectingPointer) {
                     if (selectedStrokeOrigins) {
+                        const moved = [...selectedStrokeOrigins].some(([selectedStroke, origins]) =>
+                            selectedStroke.points.some((point, index) =>
+                                point.x !== origins[index].x || point.y !== origins[index].y
+                            )
+                        );
+                        if (moved) recordHistory(gestureHistoryState);
                         status.textContent =
                             `Moved ${selectedStrokeOrigins.size} selected drawing${selectedStrokeOrigins.size === 1 ? "" : "s"}.`;
                     } else {
@@ -942,6 +1070,7 @@
                     lassoPoints = undefined;
                     selectedStrokeOrigins = undefined;
                     dragStart = undefined;
+                    gestureHistoryState = undefined;
                     activeStrokeCount--;
                     updatePageControls();
                     return;
@@ -972,6 +1101,7 @@
                         points: completedStroke.points.map(point => ({ x: point.pdfX, y: point.pdfY }))
                     };
                     const strokes = drawingsByPage[pageIndex] || [];
+                    recordHistory(gestureHistoryState);
                     strokes.push(savedStroke);
                     drawingsByPage[pageIndex] = strokes;
                     status.textContent = "Drawing added. Download the PDF to save your changes.";
@@ -979,6 +1109,8 @@
                     status.textContent = `Unable to add drawing: ${error.message}`;
                 } finally {
                     isErasingPointer = false;
+                    gestureHistoryState = undefined;
+                    eraseHistoryRecorded = false;
                     activeStrokeCount--;
                     updatePageControls();
                 }
@@ -1031,7 +1163,7 @@
                 }
                 return true;
             });
-            if (erasedCount === 0) return;
+            if (erasedCount === 0) return false;
 
             drawingsByPage[pageIndex] = remainingStrokes;
             const page = pdfViewer.querySelector(`.pdf-page[data-page-index="${pageIndex}"]`);
@@ -1046,6 +1178,7 @@
                 );
             }
             status.textContent = `${erasedCount} drawing${erasedCount === 1 ? "" : "s"} erased.`;
+            return true;
         }
 
         function drawStrokesOnPdf(page, strokes) {
@@ -1146,10 +1279,13 @@
 
             try {
                 pdfDocument = await PDFLib.PDFDocument.load(await file.arrayBuffer());
+                pdfStructureBytes = await pdfDocument.save();
                 pdfFileName = file.name.replace(/\.pdf$/i, "") + "-annotated.pdf";
                 drawingsByPage = Array.from({ length: pdfDocument.getPageCount() }, () => []);
                 selectedStrokesByPage = Array.from({ length: pdfDocument.getPageCount() }, () => new Set());
                 textRunsByPage = Array.from({ length: pdfDocument.getPageCount() });
+                undoHistory = [];
+                redoHistory = [];
                 currentPageIndex = 0;
                 zoom = 1;
                 setTextEditMode(false);
@@ -1180,6 +1316,14 @@
         });
 
         pdfViewer.addEventListener("scroll", updateCurrentPage, { passive: true });
+
+        undoButton.addEventListener("click", function() {
+            void changeHistory(undoHistory, redoHistory, "Undo");
+        });
+
+        redoButton.addEventListener("click", function() {
+            void changeHistory(redoHistory, undoHistory, "Redo");
+        });
 
         pdfViewer.addEventListener("wheel", function(event) {
             if (!event.ctrlKey || !pdfDocument) return;
@@ -1370,6 +1514,7 @@
                 try {
                     const pageToCopy = pdfDocument.getPage(pageIndex);
                     const { width, height } = pageToCopy.getSize();
+                    recordHistory(captureHistoryState());
                     pdfDocument.insertPage(pageIndex + 1, [width, height]);
                     drawingsByPage.splice(pageIndex + 1, 0, []);
                     selectedStrokesByPage.splice(pageIndex + 1, 0, new Set());
@@ -1383,6 +1528,7 @@
 
             if (button.classList.contains("page-remove") && pdfDocument.getPageCount() > 1) {
                 try {
+                    recordHistory(captureHistoryState());
                     pdfDocument.removePage(pageIndex);
                     drawingsByPage.splice(pageIndex, 1);
                     selectedStrokesByPage.splice(pageIndex, 1);
