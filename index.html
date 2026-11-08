@@ -55,6 +55,47 @@
             z-index: 1;
         }
 
+        .text-edit-layer {
+            inset: 0;
+            pointer-events: none;
+            position: absolute;
+            z-index: 2;
+        }
+
+        .text-run {
+            box-sizing: border-box;
+            display: none;
+            line-height: 1;
+            outline: none;
+            position: absolute;
+            transform-origin: 0 0;
+            white-space: pre;
+        }
+
+        .text-run.edited {
+            background: white;
+            display: block;
+            pointer-events: none;
+        }
+
+        #pdfViewer.text-editing .text-run {
+            background: white;
+            border: 1px solid #6b90dd;
+            border-radius: 2px;
+            display: block;
+            pointer-events: auto;
+        }
+
+        #pdfViewer.text-editing .text-run:focus {
+            border-color: #1677ff;
+            box-shadow: 0 0 0 1px #1677ff;
+        }
+
+        .text-run:empty::before {
+            color: #777;
+            content: attr(data-placeholder);
+        }
+
         #pdfViewer.drawing .ink-layer {
             cursor: crosshair;
             touch-action: none;
@@ -68,6 +109,10 @@
         #pdfViewer.selecting .ink-layer {
             cursor: crosshair;
             touch-action: none;
+        }
+
+        #pdfViewer.placing-text .ink-layer {
+            cursor: text;
         }
 
         #inkColor {
@@ -145,6 +190,8 @@
         <button id="drawToggle" type="button" aria-pressed="false">Draw</button>
         <button id="eraseToggle" type="button" aria-pressed="false">Erase</button>
         <button id="selectToggle" type="button" aria-pressed="false">Lasso select</button>
+        <button id="textEditToggle" type="button" aria-pressed="false">Edit text</button>
+        <button id="addTextToggle" type="button" aria-pressed="false" disabled>Add text</button>
         <label for="inkColor">Color</label>
         <input id="inkColor" type="color" value="#e53935" aria-label="Drawing color">
         <label for="inkThickness">Thickness</label>
@@ -174,6 +221,8 @@
         const drawToggle = document.getElementById("drawToggle");
         const eraseToggle = document.getElementById("eraseToggle");
         const selectToggle = document.getElementById("selectToggle");
+        const textEditToggle = document.getElementById("textEditToggle");
+        const addTextToggle = document.getElementById("addTextToggle");
         const inkColor = document.getElementById("inkColor");
         const inkThickness = document.getElementById("inkThickness");
         const inkThicknessValue = document.getElementById("inkThicknessValue");
@@ -192,9 +241,12 @@
         let isDrawing = false;
         let isErasing = false;
         let isSelecting = false;
+        let isTextEditing = false;
+        let isPlacingText = false;
         let activeStrokeCount = 0;
         let drawingsByPage = [];
         let selectedStrokesByPage = [];
+        let textRunsByPage = [];
         let pdfFileName = "annotated.pdf";
 
         pdfjsLib.GlobalWorkerOptions.workerSrc =
@@ -213,6 +265,8 @@
             drawToggle.disabled = isUpdating || activeStrokeCount > 0;
             eraseToggle.disabled = isUpdating || activeStrokeCount > 0;
             selectToggle.disabled = isUpdating || activeStrokeCount > 0;
+            textEditToggle.disabled = isUpdating || activeStrokeCount > 0;
+            addTextToggle.disabled = isUpdating || activeStrokeCount > 0 || !isTextEditing;
             downloadPdfButton.disabled = isUpdating || activeStrokeCount > 0;
             zoomLevel.textContent = `${Math.round(zoom * 100)}%`;
             pdfViewer.querySelectorAll(".page-editor-control").forEach(button => {
@@ -248,6 +302,177 @@
             updatePageControls();
         }
 
+        function normalizePdfColor(values) {
+            const components = Array.from(values || []);
+            if (!components.length || components.some(value => !Number.isFinite(Number(value)))) {
+                return undefined;
+            }
+
+            const normalized = components.map(Number);
+            if (normalized.some(value => value > 1)) {
+                normalized.forEach((value, index) => {
+                    normalized[index] = value / 255;
+                });
+            }
+
+            let red;
+            let green;
+            let blue;
+            if (normalized.length === 4) {
+                const [cyan, magenta, yellow, black] = normalized;
+                red = 1 - Math.min(1, cyan + black);
+                green = 1 - Math.min(1, magenta + black);
+                blue = 1 - Math.min(1, yellow + black);
+            } else if (normalized.length >= 3) {
+                [red, green, blue] = normalized;
+            } else if (normalized.length === 1) {
+                [red] = normalized;
+                green = red;
+                blue = red;
+            } else {
+                return undefined;
+            }
+
+            return `#${[red, green, blue].map(value =>
+                Math.round(Math.max(0, Math.min(1, value)) * 255)
+                    .toString(16).padStart(2, "0")
+            ).join("")}`;
+        }
+
+        function extractTextRuns(textContent, operatorList, page) {
+            const textItems = textContent.items.filter(item => item.str);
+            const textOperations = new Set([
+                pdfjsLib.OPS.showText,
+                pdfjsLib.OPS.showSpacedText,
+                pdfjsLib.OPS.nextLineShowText,
+                pdfjsLib.OPS.nextLineSetSpacingShowText
+            ]);
+            const colors = [];
+            const graphicsStateStack = [];
+            let fillColor = "#000000";
+
+            operatorList.fnArray.forEach((operation, index) => {
+                if (operation === pdfjsLib.OPS.save) {
+                    graphicsStateStack.push(fillColor);
+                } else if (operation === pdfjsLib.OPS.restore) {
+                    fillColor = graphicsStateStack.pop() || fillColor;
+                } else if (
+                    operation === pdfjsLib.OPS.setFillRGBColor ||
+                    operation === pdfjsLib.OPS.setFillColor ||
+                    operation === pdfjsLib.OPS.setFillColorN ||
+                    operation === pdfjsLib.OPS.setFillCMYKColor
+                ) {
+                    const color = normalizePdfColor(operatorList.argsArray[index]);
+                    if (color) fillColor = color;
+                } else if (textOperations.has(operation)) {
+                    colors.push(fillColor);
+                }
+            });
+            const colorsMatchItems = colors.length === textItems.length;
+            const commonColor = colors.length && colors.every(color => color === colors[0])
+                ? colors[0]
+                : "#000000";
+
+            return textItems.map((item, index) => {
+                const transform = item.transform || [1, 0, 0, 1, 0, 0];
+                const style = textContent.styles[item.fontName] || {};
+                const fontDetails = page.commonObjs.get(item.fontName);
+                const fontSize = Math.max(
+                    0.5,
+                    Math.hypot(transform[2], transform[3]) || item.height || 12
+                );
+                return {
+                    originalText: item.str,
+                    text: item.str,
+                    transform,
+                    x: transform[4],
+                    y: transform[5],
+                    width: Math.max(0, item.width || 0),
+                    height: Math.max(fontSize, item.height || 0),
+                    fontSize,
+                    fontFamily: style.fontFamily || "sans-serif",
+                    fontName: fontDetails.name || item.fontName || "",
+                    bold: Boolean(fontDetails.bold),
+                    italic: Boolean(fontDetails.italic),
+                    ascent: Number.isFinite(style.ascent) ? style.ascent : 0.8,
+                    descent: Number.isFinite(style.descent) ? style.descent : -0.2,
+                    rotation: Math.atan2(transform[1], transform[0]),
+                    color: colorsMatchItems ? colors[index] : commonColor,
+                    edited: false
+                };
+            });
+        }
+
+        function renderTextRuns(layer, pageIndex, viewport) {
+            layer.replaceChildren();
+            const measureContext = document.createElement("canvas").getContext("2d");
+            (textRunsByPage[pageIndex] || []).forEach((run, index) => {
+                const span = document.createElement("span");
+                const transform = pdfjsLib.Util.transform(viewport.transform, run.transform);
+                const fontSize = Math.hypot(transform[2], transform[3]);
+                const angle = Math.atan2(transform[1], transform[0]);
+                const ascent = fontSize * run.ascent;
+                span.className = `text-run${run.edited ? " edited" : ""}`;
+                span.dataset.textRunIndex = String(index);
+                if (isTextEditing) span.setAttribute("role", "textbox");
+                span.setAttribute(
+                    "aria-label",
+                    run.newText ? "New text" : `Edit PDF text: ${run.originalText}`
+                );
+                span.contentEditable = String(isTextEditing);
+                span.spellcheck = false;
+                span.textContent = run.text;
+                if (run.newText) span.dataset.placeholder = "Text";
+                span.style.left = `${transform[4] + ascent * Math.sin(angle)}px`;
+                span.style.top = `${transform[5] - ascent * Math.cos(angle)}px`;
+                span.style.fontFamily = run.fontFamily;
+                span.style.fontWeight = run.bold ? "bold" : "normal";
+                span.style.fontStyle = run.italic ? "italic" : "normal";
+                span.style.fontSize = `${fontSize}px`;
+                span.style.color = run.color;
+                span.style.transform = `rotate(${angle}rad)`;
+                function fitSpanToText() {
+                    measureContext.font =
+                        `${run.italic ? "italic " : ""}${run.bold ? "bold " : ""}` +
+                        `${fontSize}px ${run.fontFamily}`;
+                    span.style.width = `${Math.max(
+                        run.width * viewport.scale,
+                        measureContext.measureText(run.text || " ").width
+                    ) + 2}px`;
+                }
+                fitSpanToText();
+                span.addEventListener("input", function() {
+                    run.text = span.textContent;
+                    run.edited = run.text !== run.originalText;
+                    span.classList.toggle("edited", run.edited);
+                    fitSpanToText();
+                });
+                layer.appendChild(span);
+            });
+        }
+
+        function setTextEditMode(enabled) {
+            isTextEditing = enabled;
+            textEditToggle.setAttribute("aria-pressed", String(enabled));
+            textEditToggle.textContent = enabled ? "Done editing text" : "Edit text";
+            addTextToggle.disabled = !enabled;
+            if (!enabled) {
+                isPlacingText = false;
+                addTextToggle.setAttribute("aria-pressed", "false");
+                addTextToggle.textContent = "Add text";
+                pdfViewer.classList.remove("placing-text");
+            }
+            pdfViewer.classList.toggle("text-editing", enabled);
+            pdfViewer.querySelectorAll(".text-run").forEach(span => {
+                span.contentEditable = String(enabled);
+                if (enabled) {
+                    span.setAttribute("role", "textbox");
+                } else {
+                    span.removeAttribute("role");
+                }
+            });
+        }
+
         async function renderPages(targetPageIndex = currentPageIndex) {
             const generation = ++renderGeneration;
             const existingPages = pdfViewer.querySelectorAll(".pdf-page:not(.pdf-render-page)");
@@ -275,6 +500,7 @@
                     const wrapper = document.createElement("div");
                     const canvas = document.createElement("canvas");
                     const inkCanvas = document.createElement("canvas");
+                    const textLayer = document.createElement("div");
                     const removeButton = document.createElement("button");
                     const addButton = document.createElement("button");
                     const context = canvas.getContext("2d");
@@ -282,6 +508,7 @@
                     const pixelRatio = window.devicePixelRatio || 1;
                     wrapper.className = "pdf-page pdf-render-page";
                     wrapper.dataset.pageIndex = String(index);
+                    textLayer.className = "text-edit-layer";
                     canvas.width = Math.ceil(viewport.width);
                     canvas.height = Math.ceil(viewport.height);
                     inkCanvas.className = "ink-layer";
@@ -302,12 +529,21 @@
                     addButton.textContent = "+";
                     wrapper.appendChild(canvas);
                     wrapper.appendChild(inkCanvas);
+                    wrapper.appendChild(textLayer);
                     wrapper.appendChild(removeButton);
                     wrapper.appendChild(addButton);
                     pdfViewer.appendChild(wrapper);
                     stagedPages.push(wrapper);
                     await page.render({ canvasContext: context, viewport }).promise;
+                    if (textRunsByPage[index] === undefined) {
+                        const [textContent, operatorList] = await Promise.all([
+                            page.getTextContent(),
+                            page.getOperatorList()
+                        ]);
+                        textRunsByPage[index] = extractTextRuns(textContent, operatorList, page);
+                    }
                     redrawInk(inkContext, index, viewport, pixelRatio, selectedStrokesByPage[index]);
+                    renderTextRuns(textLayer, index, viewport);
                     addDrawingHandlers(inkCanvas, index, viewport, pixelRatio);
                 }
 
@@ -510,6 +746,49 @@
                 const [pdfX, pdfY] = viewport.convertToPdfPoint(x, y);
                 return { x, y, pdfX, pdfY };
             }
+
+            canvas.parentElement.addEventListener("click", function(event) {
+                if (!isTextEditing || !isPlacingText || isUpdating ||
+                    event.target.closest(".page-editor-control")) return;
+                const bounds = canvas.getBoundingClientRect();
+                if (
+                    event.clientX < bounds.left || event.clientX > bounds.right ||
+                    event.clientY < bounds.top || event.clientY > bounds.bottom
+                ) return;
+
+                const position = getPosition(event);
+                const fontSize = 16;
+                const newRun = {
+                    originalText: "",
+                    text: "",
+                    transform: [fontSize, 0, 0, fontSize, position.pdfX, position.pdfY],
+                    x: position.pdfX,
+                    y: position.pdfY,
+                    width: 0,
+                    height: fontSize,
+                    fontSize,
+                    fontFamily: "sans-serif",
+                    fontName: "Helvetica",
+                    bold: false,
+                    italic: false,
+                    ascent: 0.8,
+                    descent: -0.2,
+                    rotation: 0,
+                    color: inkColor.value,
+                    edited: false,
+                    newText: true
+                };
+                textRunsByPage[pageIndex].push(newRun);
+                const textLayer = canvas.parentElement.querySelector(".text-edit-layer");
+                renderTextRuns(textLayer, pageIndex, viewport);
+                const newTextSpan = textLayer.lastElementChild;
+                newTextSpan.focus();
+                isPlacingText = false;
+                addTextToggle.setAttribute("aria-pressed", "false");
+                addTextToggle.textContent = "Add text";
+                pdfViewer.classList.remove("placing-text");
+                status.textContent = "Type the new text in the selected box.";
+            });
 
             canvas.addEventListener("pointerdown", function(event) {
                 if ((!isDrawing && !isErasing && !isSelecting) || isUpdating ||
@@ -791,6 +1070,65 @@
             });
         }
 
+        function standardFontForRun(run) {
+            const family = `${run.fontFamily} ${run.fontName}`.toLowerCase();
+            const bold = run.bold || /bold|black|heavy|demi/.test(family);
+            const italic = run.italic || /italic|oblique/.test(family);
+            if (/mono|courier|code/.test(family)) {
+                if (bold && italic) return PDFLib.StandardFonts.CourierBoldOblique;
+                if (bold) return PDFLib.StandardFonts.CourierBold;
+                if (italic) return PDFLib.StandardFonts.CourierOblique;
+                return PDFLib.StandardFonts.Courier;
+            }
+            if (/serif|times|georgia/.test(family) && !/sans-serif/.test(family)) {
+                if (bold && italic) return PDFLib.StandardFonts.TimesRomanBoldItalic;
+                if (bold) return PDFLib.StandardFonts.TimesRomanBold;
+                if (italic) return PDFLib.StandardFonts.TimesRomanItalic;
+                return PDFLib.StandardFonts.TimesRoman;
+            }
+            if (bold && italic) return PDFLib.StandardFonts.HelveticaBoldOblique;
+            if (bold) return PDFLib.StandardFonts.HelveticaBold;
+            if (italic) return PDFLib.StandardFonts.HelveticaOblique;
+            return PDFLib.StandardFonts.Helvetica;
+        }
+
+        async function drawTextEditsOnPdf(document, page, runs, embeddedFonts) {
+            for (const run of runs) {
+                if (!run.edited) continue;
+
+                const fontName = standardFontForRun(run);
+                if (!embeddedFonts.has(fontName)) {
+                    embeddedFonts.set(fontName, await document.embedFont(fontName));
+                }
+                const font = embeddedFonts.get(fontName);
+                const textWidth = font.widthOfTextAtSize(run.text, run.fontSize);
+                const maskWidth = Math.max(run.width, textWidth) +
+                    Math.max(0.5, run.fontSize * 0.06);
+                const maskHeight = Math.max(
+                    run.height,
+                    run.fontSize * (run.ascent - run.descent)
+                );
+                page.drawRectangle({
+                    x: run.x,
+                    y: run.y + Math.min(0, run.descent * run.fontSize),
+                    width: maskWidth,
+                    height: maskHeight,
+                    color: PDFLib.rgb(1, 1, 1),
+                    rotate: PDFLib.degrees(-run.rotation * 180 / Math.PI)
+                });
+                if (run.text) {
+                    page.drawText(run.text, {
+                        x: run.x,
+                        y: run.y,
+                        font,
+                        size: run.fontSize,
+                        color: parseColor(run.color),
+                        rotate: PDFLib.degrees(-run.rotation * 180 / Math.PI)
+                    });
+                }
+            }
+        }
+
         pdfUpload.addEventListener("change", async function(event) {
             const file = event.target.files[0];
             if (!file) return;
@@ -805,8 +1143,10 @@
                 pdfFileName = file.name.replace(/\.pdf$/i, "") + "-annotated.pdf";
                 drawingsByPage = Array.from({ length: pdfDocument.getPageCount() }, () => []);
                 selectedStrokesByPage = Array.from({ length: pdfDocument.getPageCount() }, () => new Set());
+                textRunsByPage = Array.from({ length: pdfDocument.getPageCount() });
                 currentPageIndex = 0;
                 zoom = 1;
+                setTextEditMode(false);
                 drawToggle.setAttribute("aria-pressed", "false");
                 drawToggle.textContent = "Draw";
                 eraseToggle.setAttribute("aria-pressed", "false");
@@ -856,7 +1196,53 @@
             pageEditorToggle.setAttribute("aria-expanded", String(!isExpanded));
         });
 
+        textEditToggle.addEventListener("click", function() {
+            const enabled = !isTextEditing;
+            if (enabled) {
+                isDrawing = false;
+                isErasing = false;
+                isSelecting = false;
+                drawToggle.setAttribute("aria-pressed", "false");
+                drawToggle.textContent = "Draw";
+                eraseToggle.setAttribute("aria-pressed", "false");
+                eraseToggle.textContent = "Erase";
+                selectToggle.setAttribute("aria-pressed", "false");
+                selectToggle.textContent = "Lasso select";
+                pdfViewer.classList.remove("drawing", "erasing", "selecting");
+            }
+            setTextEditMode(enabled);
+
+            if (enabled && !textRunsByPage.some(runs => runs && runs.length)) {
+                status.textContent =
+                    "No selectable text was found. Scanned pages require OCR and are not detected.";
+            } else {
+                status.textContent = enabled
+                    ? "Select text on a page and type to replace it."
+                    : "Text editing is off.";
+            }
+        });
+
+        addTextToggle.addEventListener("click", function() {
+            isPlacingText = !isPlacingText;
+            addTextToggle.setAttribute("aria-pressed", String(isPlacingText));
+            addTextToggle.textContent = isPlacingText ? "Cancel text placement" : "Add text";
+            pdfViewer.classList.toggle("placing-text", isPlacingText);
+            status.textContent = isPlacingText
+                ? "Click a page to place a text box. Press Escape to cancel."
+                : "Text placement cancelled.";
+        });
+
+        document.addEventListener("keydown", function(event) {
+            if (event.key !== "Escape" || !isPlacingText) return;
+            isPlacingText = false;
+            addTextToggle.setAttribute("aria-pressed", "false");
+            addTextToggle.textContent = "Add text";
+            pdfViewer.classList.remove("placing-text");
+            status.textContent = "Text placement cancelled.";
+        });
+
         drawToggle.addEventListener("click", function() {
+            if (isTextEditing) setTextEditMode(false);
             isDrawing = !isDrawing;
             isErasing = false;
             isSelecting = false;
@@ -872,6 +1258,7 @@
         });
 
         eraseToggle.addEventListener("click", function() {
+            if (isTextEditing) setTextEditMode(false);
             isErasing = !isErasing;
             isDrawing = false;
             isSelecting = false;
@@ -887,6 +1274,7 @@
         });
 
         selectToggle.addEventListener("click", function() {
+            if (isTextEditing) setTextEditMode(false);
             isSelecting = !isSelecting;
             isDrawing = false;
             isErasing = false;
@@ -915,10 +1303,19 @@
             downloadPdfButton.disabled = true;
             try {
                 const exportDocument = await PDFLib.PDFDocument.load(await pdfDocument.save());
+                const embeddedFonts = new Map();
                 drawingsByPage.forEach((strokes, pageIndex) => {
                     const page = exportDocument.getPage(pageIndex);
                     drawStrokesOnPdf(page, strokes);
                 });
+                for (let pageIndex = 0; pageIndex < textRunsByPage.length; pageIndex++) {
+                    await drawTextEditsOnPdf(
+                        exportDocument,
+                        exportDocument.getPage(pageIndex),
+                        textRunsByPage[pageIndex] || [],
+                        embeddedFonts
+                    );
+                }
                 const pdfBytes = await exportDocument.save();
                 const downloadUrl = URL.createObjectURL(
                     new Blob([pdfBytes], { type: "application/pdf" })
@@ -948,6 +1345,7 @@
                     pdfDocument.insertPage(pageIndex + 1, [width, height]);
                     drawingsByPage.splice(pageIndex + 1, 0, []);
                     selectedStrokesByPage.splice(pageIndex + 1, 0, new Set());
+                    textRunsByPage.splice(pageIndex + 1, 0, undefined);
                     await updateDocument(pageIndex + 1);
                 } catch (error) {
                     status.textContent = `Unable to add a page: ${error.message}`;
@@ -960,6 +1358,7 @@
                     pdfDocument.removePage(pageIndex);
                     drawingsByPage.splice(pageIndex, 1);
                     selectedStrokesByPage.splice(pageIndex, 1);
+                    textRunsByPage.splice(pageIndex, 1);
                     await updateDocument(Math.min(pageIndex, pdfDocument.getPageCount() - 1));
                 } catch (error) {
                     status.textContent = `Unable to remove a page: ${error.message}`;
