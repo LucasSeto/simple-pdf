@@ -1,0 +1,29 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PDF Viewer</title>
+</head>
+<body>
+
+    <h2>PDF Viewer</h2>
+
+    <input type="file" id="pdfUpload" accept=".pdf,application/pdf">
+
+    <br><br>
+
+    <iframe id="pdfViewer" width="100%" height="600px"></iframe>
+
+    <script>
+        document.getElementById("pdfUpload").addEventListener("change", function(event) {
+            const file = event.target.files[0];
+
+            if (file && file.type === "application/pdf") {
+                const url = URL.createObjectURL(file);
+                document.getElementById("pdfViewer").src = url;
+            }
+        });
+    </script>
+
+</body>
+</html>
